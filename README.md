@@ -1,170 +1,94 @@
-# Assignment 1: Clean Architecture Microservices in Go
+# Assignment 2: gRPC Migration
 
-This repository implements the required two-service platform:
+This project migrates internal communication between `order-service` and `payment-service` from REST to gRPC.
 
-- `order-service` on port `8080`
-- `payment-service` on port `8081`
+## Services
 
-Both services use Gin for REST, PostgreSQL for persistence, and Clean Architecture layers with manual dependency injection in `main.go`.
-
-## What Is Already Covered
-
-- Separate bounded contexts for Orders and Payments
-- Separate databases: `order_db` and `payment_db`
-- No shared entity/model package between services
-- Thin HTTP handlers
-- Business rules in use cases
-- PostgreSQL repositories
-- REST-only communication from Order Service to Payment Service
-- Shared `http.Client` instance with `2s` timeout in the Order Service payment adapter
-- Failure handling with `503 Service Unavailable` when Payment Service is unreachable
-- Idempotency support via `Idempotency-Key` header for `POST /orders`
-
-## Project Structure
-
-```text
-order-service/
-payment-service/
-docker-compose.yml
-infra/postgres/init/
-```
-
-Each service follows:
-
-```text
-service/
-├── cmd/service-name/main.go
-├── internal/domain
-├── internal/usecase
-├── internal/repository
-├── internal/transport/http
-└── migrations
-```
-
-## Architecture Decisions
-
-- `order-service` owns order creation, cancellation, and state transitions.
-- `payment-service` owns payment authorization and payment limits.
-- `order-service` never reads or writes the payment database directly.
-- Money is stored as `int64` cents everywhere.
-- If payment authorization fails because the service is unavailable, the order is marked as `Failed`.
-
-That last choice is intentional for defense: it gives a clear final state without background retries and satisfies the required `503` behavior.
+- `order-service`
+  - REST API for end users
+  - gRPC client for `payment-service`
+  - gRPC server for order status streaming
+- `payment-service`
+  - gRPC server for payment processing
 
 ## Architecture Diagram
 
 ```mermaid
 flowchart LR
-    Client["Client"] -->|POST /orders| OrderHandler["Order HTTP Handler"]
-    Client -->|GET /orders/:id| OrderHandler
-    Client -->|PATCH /orders/:id/cancel| OrderHandler
-    OrderHandler --> OrderUseCase["Order Use Case"]
-    OrderUseCase --> OrderRepo["Order Repository"]
+    Client["Client"] -->|HTTP REST| OrderHTTP["Order Service HTTP API"]
+    OrderHTTP --> OrderUC["Order Use Case"]
+    OrderUC --> OrderRepo["Order Repository"]
     OrderRepo --> OrderDB[("order_db")]
-    OrderUseCase -->|POST /payments via REST, timeout 2s| PaymentHandler["Payment HTTP Handler"]
-    PaymentHandler --> PaymentUseCase["Payment Use Case"]
-    PaymentUseCase --> PaymentRepo["Payment Repository"]
+    OrderUC -->|gRPC ProcessPayment| PaymentGRPC["Payment Service gRPC Server"]
+    PaymentGRPC --> PaymentUC["Payment Use Case"]
+    PaymentUC --> PaymentRepo["Payment Repository"]
     PaymentRepo --> PaymentDB[("payment_db")]
+    StreamClient["Stream Client"] -->|gRPC SubscribeToOrderUpdates| OrderGRPC["Order Service gRPC Server"]
+    OrderGRPC --> OrderUC
 ```
 
-## PostgreSQL Setup
+## Contracts
 
-### Option 1: Docker Compose
+- Proto source: `proto-repository/`
+- Generated Go contracts: `generated-contracts/`
+
+Replace `github.com/youruser/ap2-generated-contracts` in:
+
+- `proto-repository/proto/order/v1/order.proto`
+- `proto-repository/proto/payment/v1/payment.proto`
+- `generated-contracts/go.mod`
+- `order-service/go.mod`
+- `payment-service/go.mod`
+
+with your real generated-contract repository path before submission.
+
+## Environment
+
+Use `.env.example`:
+
+```env
+ORDER_DATABASE_URL=postgres://postgres:postgres@localhost:5433/order_db?sslmode=disable
+PAYMENT_DATABASE_URL=postgres://postgres:postgres@localhost:5433/payment_db?sslmode=disable
+ORDER_HTTP_ADDR=:8080
+ORDER_GRPC_ADDR=:9090
+ORDER_GRPC_TARGET=localhost:9090
+PAYMENT_GRPC_ADDR=:9091
+PAYMENT_GRPC_TARGET=localhost:9091
+```
+
+## Run
+
+1. Start PostgreSQL with `docker compose up -d`.
+2. Apply migrations:
 
 ```bash
-docker compose up -d postgres
-make migrate-order
-make migrate-payment
+psql "$ORDER_DATABASE_URL" -f order-service/migrations/001_init.sql
+psql "$PAYMENT_DATABASE_URL" -f payment-service/migrations/001_init.sql
 ```
 
-`docker-compose.yml` starts one PostgreSQL server and creates two isolated databases:
-
-- `order_db`
-- `payment_db`
-
-### Option 2: Manual Postgres
-
-```sql
-CREATE DATABASE order_db;
-CREATE DATABASE payment_db;
-```
-
-Then run:
+3. Start Payment Service:
 
 ```bash
-psql "postgres://postgres:postgres@localhost:5433/order_db?sslmode=disable" -f order-service/migrations/001_init.sql
-psql "postgres://postgres:postgres@localhost:5433/payment_db?sslmode=disable" -f payment-service/migrations/001_init.sql
+cd payment-service
+go run ./cmd/payment-service
 ```
 
-## Running the Services
-
-Terminal 1:
+4. Start Order Service:
 
 ```bash
-make run-payment
+cd order-service
+go run ./cmd/order-service
 ```
 
-Terminal 2:
+5. Optional stream client:
 
 ```bash
-make run-order
+cd order-service
+ORDER_ID=<order-id> ORDER_GRPC_TARGET=localhost:9090 go run ./cmd/order-stream-client
 ```
 
-Default connection values come from [`.env.example`](/Users/admin/Assignment1GO_Sanat/.env.example).
+## Notes
 
-## API Examples
-
-Create order:
-
-```bash
-curl -X POST http://localhost:8080/orders \
-  -H "Content-Type: application/json" \
-  -H "Idempotency-Key: order-001" \
-  -d '{"customer_id":"cust-1","item_name":"Keyboard","amount":15000}'
-```
-
-Get order:
-
-```bash
-curl http://localhost:8080/orders/<order_id>
-```
-
-Cancel order:
-
-```bash
-curl -X PATCH http://localhost:8080/orders/<order_id>/cancel
-```
-
-Authorize payment directly:
-
-```bash
-curl -X POST http://localhost:8081/payments \
-  -H "Content-Type: application/json" \
-  -d '{"order_id":"order-123","amount":15000}'
-```
-
-Get payment by order id:
-
-```bash
-curl http://localhost:8081/payments/order-123
-```
-
-Declined payment example:
-
-```bash
-curl -X POST http://localhost:8081/payments \
-  -H "Content-Type: application/json" \
-  -d '{"order_id":"order-999","amount":150001}'
-```
-
-## Defense Notes
-
-- `Paid` orders cannot be cancelled because cancellation is allowed only for `Pending`.
-- Amount must be greater than zero in both services.
-- Payment amounts greater than `100000` are declined.
-- Order Service uses a custom outbound HTTP client with a `2s` timeout.
-- When Payment Service is down, Order Service returns `503` and sets order status to `Failed`.
-
-## Verification
-
-`go test ./...` builds both services successfully, but in this environment the Go tool exits with a cache-permission warning when trimming the global build cache. The packages themselves compile.
+- Payment processing now uses gRPC `ProcessPayment`.
+- Order tracking uses server-side streaming `SubscribeToOrderUpdates`.
+- Payment service has a unary interceptor for request logging.

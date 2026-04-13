@@ -15,6 +15,7 @@ type OrderRepository interface {
 	UpdateStatus(ctx context.Context, id string, status string) error
 	SaveIdempotencyKey(ctx context.Context, key string, orderID string) error
 	GetOrderByIdempotencyKey(ctx context.Context, key string) (*domain.Order, error)
+	Subscribe(orderID string) (<-chan domain.OrderStatusEvent, func())
 }
 
 type PaymentClient interface {
@@ -36,6 +37,7 @@ func NewOrderUseCase(repo OrderRepository, paymentClient PaymentClient) *OrderUs
 var ErrPaymentServiceUnavailable = errors.New("payment service unavailable")
 var ErrInvalidAmount = errors.New("amount must be greater than 0")
 var ErrOrderCannotBeCancelled = errors.New("only pending orders can be cancelled")
+var ErrOrderNotFound = errors.New("order not found")
 
 func (uc *OrderUseCase) CreateOrder(ctx context.Context, customerID string, itemName string, amount int64, idempotencyKey string) (*domain.Order, error) {
 	if amount <= 0 {
@@ -114,4 +116,69 @@ func (uc *OrderUseCase) CancelOrder(ctx context.Context, id string) (*domain.Ord
 	order.Status = "Cancelled"
 
 	return order, nil
+}
+
+func (uc *OrderUseCase) SubscribeToOrderUpdates(
+	ctx context.Context,
+	orderID string,
+	emit func(domain.OrderStatusEvent) error,
+) error {
+	order, err := uc.repo.GetByID(ctx, orderID)
+	if err != nil {
+		return err
+	}
+	if order == nil {
+		return ErrOrderNotFound
+	}
+
+	lastStatus := order.Status
+	if err := emit(domain.OrderStatusEvent{
+		OrderID:   order.ID,
+		Status:    order.Status,
+		ChangedAt: order.CreatedAt,
+		Source:    "initial_snapshot",
+	}); err != nil {
+		return err
+	}
+
+	updates, unsubscribe := uc.repo.Subscribe(orderID)
+	defer unsubscribe()
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case update := <-updates:
+			if update.Status == lastStatus {
+				continue
+			}
+			lastStatus = update.Status
+			if err := emit(update); err != nil {
+				return err
+			}
+		case <-ticker.C:
+			current, err := uc.repo.GetByID(ctx, orderID)
+			if err != nil {
+				return err
+			}
+			if current == nil {
+				return ErrOrderNotFound
+			}
+			if current.Status == lastStatus {
+				continue
+			}
+			lastStatus = current.Status
+			if err := emit(domain.OrderStatusEvent{
+				OrderID:   current.ID,
+				Status:    current.Status,
+				ChangedAt: time.Now(),
+				Source:    "database_poll",
+			}); err != nil {
+				return err
+			}
+		}
+	}
 }

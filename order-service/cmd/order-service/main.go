@@ -2,25 +2,28 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"log"
+	"net"
+	nethttp "net/http"
 	"os"
 
 	"github.com/gin-gonic/gin"
+	orderv1 "github.com/youruser/ap2-generated-contracts/order/v1"
 	_ "github.com/lib/pq"
 	"order-service/internal/repository"
+	grpctransport "order-service/internal/transport/grpc"
 	"order-service/internal/transport/http"
 	"order-service/internal/usecase"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func main() {
-	dbConnStr := os.Getenv("DATABASE_URL")
-	if dbConnStr == "" {
-		dbConnStr = "postgres://postgres:postgres@localhost:5433/order_db?sslmode=disable"
-	}
-	paymentServiceURL := os.Getenv("PAYMENT_SERVICE_URL")
-	if paymentServiceURL == "" {
-		paymentServiceURL = "http://localhost:8081"
-	}
+	dbConnStr := mustEnv("ORDER_DATABASE_URL")
+	httpAddr := mustEnv("ORDER_HTTP_ADDR")
+	grpcAddr := mustEnv("ORDER_GRPC_ADDR")
+	paymentTarget := mustEnv("PAYMENT_GRPC_TARGET")
 
 	db, err := sql.Open("postgres", dbConnStr)
 	if err != nil {
@@ -31,14 +34,58 @@ func main() {
 	}
 
 	repo := repository.NewOrderRepository(db)
-	paymentClient := http.NewPaymentClient(paymentServiceURL)
+
+	paymentConn, err := grpc.Dial(
+		paymentTarget,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		log.Fatalf("failed to connect to payment service: %v", err)
+	}
+	defer paymentConn.Close()
+
+	paymentClient := grpctransport.NewPaymentClient(paymentConn)
 	uc := usecase.NewOrderUseCase(repo, paymentClient)
 
 	r := gin.Default()
 	http.NewOrderHandler(r, uc)
 
-	log.Println("Order service starting on :8080")
-	if err := r.Run(":8080"); err != nil {
+	httpServer := &nethttp.Server{
+		Addr:    httpAddr,
+		Handler: r,
+	}
+
+	lis, err := net.Listen("tcp", grpcAddr)
+	if err != nil {
+		log.Fatalf("failed to listen for gRPC server: %v", err)
+	}
+
+	grpcServer := grpc.NewServer()
+	orderv1.RegisterOrderServiceServer(grpcServer, grpctransport.NewOrderServer(uc))
+
+	errCh := make(chan error, 2)
+
+	go func() {
+		log.Printf("Order HTTP service listening on %s", httpAddr)
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, nethttp.ErrServerClosed) {
+			errCh <- err
+		}
+	}()
+
+	go func() {
+		log.Printf("Order gRPC service listening on %s", grpcAddr)
+		errCh <- grpcServer.Serve(lis)
+	}()
+
+	if err := <-errCh; err != nil {
 		log.Fatalf("failed to run server: %v", err)
 	}
+}
+
+func mustEnv(key string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		log.Fatalf("%s must be set", key)
+	}
+	return value
 }
