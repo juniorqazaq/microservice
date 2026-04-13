@@ -10,3 +10,10 @@ type Order struct {
 	Status     string
 	CreatedAt  time.Time
 }
+
+type OrderStatusEvent struct {
+	OrderID   string
+	Status    string
+	ChangedAt time.Time
+	Source    string
+}

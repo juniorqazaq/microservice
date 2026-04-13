@@ -4,16 +4,24 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sync"
+	"time"
 
 	"order-service/internal/domain"
 )
 
 type OrderRepository struct {
-	db *sql.DB
+	db               *sql.DB
+	mu               sync.RWMutex
+	nextSubscriberID int
+	subscribers      map[string]map[int]chan domain.OrderStatusEvent
 }
 
 func NewOrderRepository(db *sql.DB) *OrderRepository {
-	return &OrderRepository{db: db}
+	return &OrderRepository{
+		db:          db,
+		subscribers: make(map[string]map[int]chan domain.OrderStatusEvent),
+	}
 }
 
 func (r *OrderRepository) Create(ctx context.Context, o *domain.Order) error {
@@ -22,7 +30,17 @@ func (r *OrderRepository) Create(ctx context.Context, o *domain.Order) error {
 		VALUES ($1, $2, $3, $4, $5, $6)
 	`
 	_, err := r.db.ExecContext(ctx, query, o.ID, o.CustomerID, o.ItemName, o.Amount, o.Status, o.CreatedAt)
-	return err
+	if err != nil {
+		return err
+	}
+
+	r.publish(domain.OrderStatusEvent{
+		OrderID:   o.ID,
+		Status:    o.Status,
+		ChangedAt: o.CreatedAt,
+		Source:    "repository_create",
+	})
+	return nil
 }
 
 func (r *OrderRepository) GetByID(ctx context.Context, id string) (*domain.Order, error) {
@@ -47,7 +65,17 @@ func (r *OrderRepository) GetByID(ctx context.Context, id string) (*domain.Order
 func (r *OrderRepository) UpdateStatus(ctx context.Context, id string, status string) error {
 	query := `UPDATE orders SET status = $1 WHERE id = $2`
 	_, err := r.db.ExecContext(ctx, query, status, id)
-	return err
+	if err != nil {
+		return err
+	}
+
+	r.publish(domain.OrderStatusEvent{
+		OrderID:   id,
+		Status:    status,
+		ChangedAt: time.Now(),
+		Source:    "repository_update",
+	})
+	return nil
 }
 
 func (r *OrderRepository) SaveIdempotencyKey(ctx context.Context, key string, orderID string) error {
@@ -74,4 +102,52 @@ func (r *OrderRepository) GetOrderByIdempotencyKey(ctx context.Context, key stri
 		return nil, err
 	}
 	return &o, nil
+}
+
+func (r *OrderRepository) Subscribe(orderID string) (<-chan domain.OrderStatusEvent, func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.subscribers[orderID] == nil {
+		r.subscribers[orderID] = make(map[int]chan domain.OrderStatusEvent)
+	}
+
+	subscriberID := r.nextSubscriberID
+	r.nextSubscriberID++
+
+	ch := make(chan domain.OrderStatusEvent, 8)
+	r.subscribers[orderID][subscriberID] = ch
+
+	unsubscribe := func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+
+		orderSubscribers := r.subscribers[orderID]
+		if orderSubscribers == nil {
+			return
+		}
+
+		if existing, ok := orderSubscribers[subscriberID]; ok {
+			delete(orderSubscribers, subscriberID)
+			close(existing)
+		}
+
+		if len(orderSubscribers) == 0 {
+			delete(r.subscribers, orderID)
+		}
+	}
+
+	return ch, unsubscribe
+}
+
+func (r *OrderRepository) publish(event domain.OrderStatusEvent) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	for _, ch := range r.subscribers[event.OrderID] {
+		select {
+		case ch <- event:
+		default:
+		}
+	}
 }
