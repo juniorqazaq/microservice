@@ -18,13 +18,12 @@ func NewPaymentClient(conn grpc.ClientConnInterface) *PaymentClient {
 	}
 }
 
-func (c *PaymentClient) AuthorizePayment(ctx context.Context, orderID string, amount int64) (string, error) {
 	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
 	response, err := c.client.ProcessPayment(callCtx, &paymentv1.PaymentRequest{
-		OrderId: orderID,
-		Amount:  amount,
+		OrderId:       orderID,
+		Amount:        amount,
 	})
 	if err != nil {
 		return "", err

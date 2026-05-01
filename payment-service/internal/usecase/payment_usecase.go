@@ -15,25 +15,22 @@ type PaymentRepository interface {
 }
 
 type PaymentUseCase struct {
-	repo PaymentRepository
+	repo      PaymentRepository
 }
 
 var ErrInvalidAmount = errors.New("amount must be greater than 0")
 
-func NewPaymentUseCase(repo PaymentRepository) *PaymentUseCase {
-	return &PaymentUseCase{repo: repo}
 }
 
-func (uc *PaymentUseCase) AuthorizePayment(ctx context.Context, orderID string, amount int64) (*domain.Payment, error) {
 	if amount <= 0 {
 		return nil, ErrInvalidAmount
 	}
 
 	payment := &domain.Payment{
-		ID:        uuid.New().String(),
-		OrderID:   orderID,
-		Amount:    amount,
-		CreatedAt: time.Now(),
+		ID:            uuid.New().String(),
+		OrderID:       orderID,
+		Amount:        amount,
+		CreatedAt:     time.Now(),
 	}
 
 	if amount > 100000 {

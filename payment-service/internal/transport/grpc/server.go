@@ -28,7 +28,6 @@ func (s *PaymentServer) ProcessPayment(ctx context.Context, req *paymentv1.Payme
 		return nil, status.Error(codes.InvalidArgument, "order_id is required")
 	}
 
-	payment, err := s.usecase.AuthorizePayment(ctx, req.GetOrderId(), req.GetAmount())
 	if err != nil {
 		if errors.Is(err, usecase.ErrInvalidAmount) {
 			return nil, status.Error(codes.InvalidArgument, err.Error())

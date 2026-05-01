@@ -27,7 +27,6 @@ func main() {
 	}
 
 	repo := repository.NewPaymentRepository(db)
-	uc := usecase.NewPaymentUseCase(repo)
 
 	lis, err := net.Listen("tcp", grpcAddr)
 	if err != nil {
