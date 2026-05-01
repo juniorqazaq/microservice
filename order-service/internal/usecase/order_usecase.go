@@ -19,7 +19,6 @@ type OrderRepository interface {
 }
 
 type PaymentClient interface {
-	AuthorizePayment(ctx context.Context, orderID string, amount int64) (string, error)
 }
 
 type OrderUseCase struct {
@@ -73,7 +72,6 @@ func (uc *OrderUseCase) CreateOrder(ctx context.Context, customerID string, item
 		}
 	}
 
-	status, err := uc.paymentClient.AuthorizePayment(ctx, order.ID, order.Amount)
 
 	newStatus := ""
 	var returnErr error
