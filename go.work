@@ -1,7 +1,15 @@
+<<<<<<< HEAD
 go 1.25.4
 
 use (
 	./generated-contracts
+=======
+go 1.24.0
+
+use (
+	./generated-contracts
+	./notification-service
+>>>>>>> 2c60cb0 (chore: initial project structure and go workspace setup)
 	./order-service
 	./payment-service
 )
