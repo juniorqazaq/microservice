@@ -5,27 +5,30 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"strings"
-	"sync"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/redis/go-redis/v9"
+	"notification-service/internal/provider"
 )
 
 type RabbitMQConsumer struct {
-	conn            *amqp.Connection
-	ch              *amqp.Channel
-	processedEvents sync.Map
+	conn        *amqp.Connection
+	ch          *amqp.Channel
+	redisClient *redis.Client
+	emailSender provider.EmailSender
 }
 
 type PaymentCompletedEvent struct {
+	EventID       string `json:"event_id"`
 	OrderID       string `json:"order_id"`
 	Amount        int64  `json:"amount"`
 	CustomerEmail string `json:"customer_email"`
 	Status        string `json:"status"`
 }
 
-func NewRabbitMQConsumer(amqpURL string) (*RabbitMQConsumer, error) {
-	conn, err := amqp.Dial(amqpURL)
+func NewRabbitMQConsumer(amqpURL string, redisClient *redis.Client, emailSender provider.EmailSender) (*RabbitMQConsumer, error) {
+	conn, err := dialWithRetry(amqpURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to RabbitMQ: %w", err)
 	}
@@ -87,6 +90,7 @@ func NewRabbitMQConsumer(amqpURL string) (*RabbitMQConsumer, error) {
 	args := amqp.Table{
 		"x-dead-letter-exchange":    "payment_events_dlx",
 		"x-dead-letter-routing-key": "payment.completed",
+		"x-message-ttl":             int32(300000),
 	}
 	q, err := ch.QueueDeclare(
 		"payment_completed_queue",
@@ -112,9 +116,25 @@ func NewRabbitMQConsumer(amqpURL string) (*RabbitMQConsumer, error) {
 	}
 
 	return &RabbitMQConsumer{
-		conn: conn,
-		ch:   ch,
+		conn:        conn,
+		ch:          ch,
+		redisClient: redisClient,
+		emailSender: emailSender,
 	}, nil
+}
+
+func dialWithRetry(amqpURL string) (*amqp.Connection, error) {
+	var lastErr error
+	for attempt := 1; attempt <= 30; attempt++ {
+		conn, err := amqp.Dial(amqpURL)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		log.Printf("RabbitMQ is not ready yet, retrying connection attempt %d/30: %v", attempt, err)
+		time.Sleep(2 * time.Second)
+	}
+	return nil, lastErr
 }
 
 func (c *RabbitMQConsumer) Start(ctx context.Context) error {
@@ -142,23 +162,12 @@ func (c *RabbitMQConsumer) Start(ctx context.Context) error {
 			if !ok {
 				return fmt.Errorf("consumer channel closed")
 			}
-			c.handleMessage(msg)
+			c.handleMessage(ctx, msg)
 		}
 	}
 }
 
-func (c *RabbitMQConsumer) handleMessage(msg amqp.Delivery) {
-	paymentID := msg.MessageId
-	if paymentID == "" {
-		log.Println("[Warning] Message received without MessageId, processing anyway but cannot ensure idempotency.")
-	} else {
-		if _, exists := c.processedEvents.Load(paymentID); exists {
-			log.Printf("[Idempotency] Skipping already processed message ID: %s", paymentID)
-			_ = msg.Ack(false)
-			return
-		}
-	}
-
+func (c *RabbitMQConsumer) handleMessage(ctx context.Context, msg amqp.Delivery) {
 	var event PaymentCompletedEvent
 	if err := json.Unmarshal(msg.Body, &event); err != nil {
 		log.Printf("[Error] Failed to unmarshal message: %v", err)
@@ -166,21 +175,73 @@ func (c *RabbitMQConsumer) handleMessage(msg amqp.Delivery) {
 		return
 	}
 
-	if strings.Contains(event.CustomerEmail, "fail@") || strings.Contains(event.CustomerEmail, "simulate_dlq") {
-		log.Printf("[Error] Simulating permanent failure for email: %s", event.CustomerEmail)
+	paymentID := msg.MessageId
+	if paymentID == "" {
+		paymentID = event.EventID
+	}
+	if paymentID == "" {
+		log.Println("[Error] Message received without payment ID, cannot ensure idempotency.")
 		_ = msg.Nack(false, false)
 		return
 	}
 
-	log.Printf("[Notification] Sent email to %s for Order #%s. Amount: $%d", event.CustomerEmail, event.OrderID, event.Amount/100)
-	
-	if paymentID != "" {
-		c.processedEvents.Store(paymentID, true)
+	idempotencyKey := "notif:" + paymentID
+	locked, err := c.redisClient.SetNX(ctx, idempotencyKey, "processing", 24*time.Hour).Result()
+	if err != nil {
+		log.Printf("[Error] Failed to check idempotency in Redis: %v", err)
+		_ = msg.Nack(false, true)
+		return
+	}
+	if !locked {
+		log.Printf("[Idempotency] Skipping already processed payment ID: %s", paymentID)
+		_ = msg.Ack(false)
+		return
 	}
 
+	if err := sendWithRetry(ctx, c.emailSender, event); err != nil {
+		log.Printf("[Error] Failed to send notification after retries: %v", err)
+		_ = c.redisClient.Del(ctx, idempotencyKey).Err()
+		_ = msg.Nack(false, false)
+		return
+	}
+
+	if err := c.redisClient.Set(ctx, idempotencyKey, "done", 24*time.Hour).Err(); err != nil {
+		log.Printf("[Error] Failed to mark notification as done in Redis: %v", err)
+		_ = c.redisClient.Del(ctx, idempotencyKey).Err()
+		_ = msg.Nack(false, true)
+		return
+	}
 	if err := msg.Ack(false); err != nil {
 		log.Printf("[Error] Failed to ACK message: %v", err)
 	}
+}
+
+func sendWithRetry(ctx context.Context, sender provider.EmailSender, event PaymentCompletedEvent) error {
+	subject := fmt.Sprintf("Payment completed for order %s", event.OrderID)
+	body := fmt.Sprintf("Your payment for order %s was completed. Amount: $%.2f", event.OrderID, float64(event.Amount)/100)
+	delays := []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
+
+	var lastErr error
+	for attempt := 0; attempt <= len(delays); attempt++ {
+		if err := sender.Send(ctx, event.CustomerEmail, subject, body); err == nil {
+			return nil
+		} else {
+			lastErr = err
+			log.Printf("[Retry] Notification attempt %d failed: %v", attempt+1, err)
+		}
+
+		if attempt == len(delays) {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delays[attempt]):
+		}
+	}
+
+	return lastErr
 }
 
 func (c *RabbitMQConsumer) Close() {
