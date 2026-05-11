@@ -14,14 +14,25 @@ type PaymentRepository interface {
 	GetByOrderID(ctx context.Context, orderID string) (*domain.Payment, error)
 }
 
+type PaymentEventPublisher interface {
+	PublishPaymentCompleted(ctx context.Context, payment *domain.Payment) error
+}
+
 type PaymentUseCase struct {
 	repo      PaymentRepository
+	publisher PaymentEventPublisher
 }
 
 var ErrInvalidAmount = errors.New("amount must be greater than 0")
 
+func NewPaymentUseCase(repo PaymentRepository, publisher PaymentEventPublisher) *PaymentUseCase {
+	return &PaymentUseCase{
+		repo:      repo,
+		publisher: publisher,
+	}
 }
 
+func (uc *PaymentUseCase) ProcessPayment(ctx context.Context, orderID string, amount int64, customerEmail string) (*domain.Payment, error) {
 	if amount <= 0 {
 		return nil, ErrInvalidAmount
 	}
@@ -29,6 +40,7 @@ var ErrInvalidAmount = errors.New("amount must be greater than 0")
 	payment := &domain.Payment{
 		ID:            uuid.New().String(),
 		OrderID:       orderID,
+		CustomerEmail: customerEmail,
 		Amount:        amount,
 		CreatedAt:     time.Now(),
 	}
@@ -43,6 +55,12 @@ var ErrInvalidAmount = errors.New("amount must be greater than 0")
 
 	if err := uc.repo.Create(ctx, payment); err != nil {
 		return nil, err
+	}
+
+	if payment.Status == "Authorized" && uc.publisher != nil {
+		if err := uc.publisher.PublishPaymentCompleted(ctx, payment); err != nil {
+			return nil, err
+		}
 	}
 
 	return payment, nil

@@ -1,9 +1,11 @@
 module payment-service
 
+go 1.24.0
 
 require (
 	github.com/google/uuid v1.6.0
 	github.com/lib/pq v1.12.0
+	github.com/rabbitmq/amqp091-go v1.11.0
 	github.com/youruser/ap2-generated-contracts v0.0.0
 	google.golang.org/grpc v1.65.0
 	google.golang.org/protobuf v1.36.10

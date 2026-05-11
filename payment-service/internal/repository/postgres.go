@@ -18,22 +18,22 @@ func NewPaymentRepository(db *sql.DB) *PaymentRepository {
 
 func (r *PaymentRepository) Create(ctx context.Context, p *domain.Payment) error {
 	query := `
-		INSERT INTO payments (id, order_id, transaction_id, amount, status, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO payments (id, order_id, customer_email, transaction_id, amount, status, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 	`
-	_, err := r.db.ExecContext(ctx, query, p.ID, p.OrderID, p.TransactionID, p.Amount, p.Status, p.CreatedAt)
+	_, err := r.db.ExecContext(ctx, query, p.ID, p.OrderID, p.CustomerEmail, p.TransactionID, p.Amount, p.Status, p.CreatedAt)
 	return err
 }
 
 func (r *PaymentRepository) GetByOrderID(ctx context.Context, orderID string) (*domain.Payment, error) {
 	query := `
-		SELECT id, order_id, transaction_id, amount, status, created_at
+		SELECT id, order_id, customer_email, transaction_id, amount, status, created_at
 		FROM payments
 		WHERE order_id = $1
 	`
 	var p domain.Payment
 	err := r.db.QueryRowContext(ctx, query, orderID).Scan(
-		&p.ID, &p.OrderID, &p.TransactionID, &p.Amount, &p.Status, &p.CreatedAt,
+		&p.ID, &p.OrderID, &p.CustomerEmail, &p.TransactionID, &p.Amount, &p.Status, &p.CreatedAt,
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

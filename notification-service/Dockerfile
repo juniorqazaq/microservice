@@ -4,7 +4,7 @@ ENV GOTOOLCHAIN=local
 
 WORKDIR /workspace
 
-COPY go.work go.work.sum ./
+COPY go.work ./
 COPY generated-contracts/ ./generated-contracts/
 COPY proto-repository/ ./proto-repository/
 COPY order-service/ ./order-service/

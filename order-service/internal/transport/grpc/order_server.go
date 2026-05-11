@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	orderv1 "github.com/youruser/ap2-generated-contracts/order/v1"
+	orderv1 "github.com/youruser/ap2-generated-contracts/proto/order/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"

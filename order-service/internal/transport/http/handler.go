@@ -21,9 +21,10 @@ func NewOrderHandler(router *gin.Engine, uc *usecase.OrderUseCase) {
 }
 
 type CreateOrderRequest struct {
-	CustomerID string `json:"customer_id" binding:"required"`
-	ItemName   string `json:"item_name" binding:"required"`
-	Amount     int64  `json:"amount" binding:"required"`
+	CustomerID    string `json:"customer_id" binding:"required"`
+	CustomerEmail string `json:"customer_email" binding:"required,email"`
+	ItemName      string `json:"item_name" binding:"required"`
+	Amount        int64  `json:"amount" binding:"required"`
 }
 
 func (h *OrderHandler) CreateOrder(c *gin.Context) {
@@ -35,7 +36,7 @@ func (h *OrderHandler) CreateOrder(c *gin.Context) {
 
 	idempotencyKey := c.GetHeader("Idempotency-Key")
 
-	order, err := h.usecase.CreateOrder(c.Request.Context(), req.CustomerID, req.ItemName, req.Amount, idempotencyKey)
+	order, err := h.usecase.CreateOrder(c.Request.Context(), req.CustomerID, req.CustomerEmail, req.ItemName, req.Amount, idempotencyKey)
 	if err != nil {
 		if errors.Is(err, usecase.ErrInvalidAmount) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})

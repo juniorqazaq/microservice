@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	paymentv1 "github.com/youruser/ap2-generated-contracts/payment/v1"
+	paymentv1 "github.com/youruser/ap2-generated-contracts/proto/payment/v1"
 	"google.golang.org/grpc"
 )
 
@@ -18,12 +18,14 @@ func NewPaymentClient(conn grpc.ClientConnInterface) *PaymentClient {
 	}
 }
 
+func (c *PaymentClient) ProcessPayment(ctx context.Context, orderID string, amount int64, customerEmail string) (string, error) {
 	callCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
 	response, err := c.client.ProcessPayment(callCtx, &paymentv1.PaymentRequest{
 		OrderId:       orderID,
 		Amount:        amount,
+		CustomerEmail: customerEmail,
 	})
 	if err != nil {
 		return "", err
