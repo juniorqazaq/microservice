@@ -1,22 +1,27 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"log"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 
-	paymentv1 "github.com/youruser/ap2-generated-contracts/payment/v1"
 	_ "github.com/lib/pq"
+	paymentv1 "github.com/youruser/ap2-generated-contracts/proto/payment/v1"
+	"google.golang.org/grpc"
+	"payment-service/internal/infrastructure"
 	"payment-service/internal/repository"
 	grpctransport "payment-service/internal/transport/grpc"
 	"payment-service/internal/usecase"
-	"google.golang.org/grpc"
 )
 
 func main() {
 	dbConnStr := mustEnv("PAYMENT_DATABASE_URL")
 	grpcAddr := mustEnv("PAYMENT_GRPC_ADDR")
+	rabbitURL := mustEnv("RABBITMQ_URL")
 
 	db, err := sql.Open("postgres", dbConnStr)
 	if err != nil {
@@ -25,8 +30,15 @@ func main() {
 	if err := db.Ping(); err != nil {
 		log.Fatalf("failed to ping db: %v", err)
 	}
+	defer db.Close()
 
 	repo := repository.NewPaymentRepository(db)
+	publisher, err := infrastructure.NewRabbitMQPublisher(rabbitURL)
+	if err != nil {
+		log.Fatalf("failed to initialize RabbitMQ publisher: %v", err)
+	}
+	defer publisher.Close()
+	uc := usecase.NewPaymentUseCase(repo, publisher)
 
 	lis, err := net.Listen("tcp", grpcAddr)
 	if err != nil {
@@ -37,8 +49,22 @@ func main() {
 	paymentv1.RegisterPaymentServiceServer(grpcServer, grpctransport.NewPaymentServer(uc))
 
 	log.Printf("Payment gRPC service listening on %s", grpcAddr)
-	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("failed to run server: %v", err)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- grpcServer.Serve(lis)
+	}()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	select {
+	case <-ctx.Done():
+		log.Println("Shutting down Payment Service gracefully...")
+		grpcServer.GracefulStop()
+	case err := <-errCh:
+		if err != nil {
+			log.Fatalf("failed to run server: %v", err)
+		}
 	}
 }
 

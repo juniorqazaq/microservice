@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	paymentv1 "github.com/youruser/ap2-generated-contracts/payment/v1"
+	paymentv1 "github.com/youruser/ap2-generated-contracts/proto/payment/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -27,7 +27,11 @@ func (s *PaymentServer) ProcessPayment(ctx context.Context, req *paymentv1.Payme
 	if req.GetOrderId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "order_id is required")
 	}
+	if req.GetCustomerEmail() == "" {
+		return nil, status.Error(codes.InvalidArgument, "customer_email is required")
+	}
 
+	payment, err := s.usecase.ProcessPayment(ctx, req.GetOrderId(), req.GetAmount(), req.GetCustomerEmail())
 	if err != nil {
 		if errors.Is(err, usecase.ErrInvalidAmount) {
 			return nil, status.Error(codes.InvalidArgument, err.Error())

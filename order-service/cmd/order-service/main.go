@@ -1,22 +1,30 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"log"
 	"net"
 	nethttp "net/http"
 	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
-	orderv1 "github.com/youruser/ap2-generated-contracts/order/v1"
 	_ "github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
+	orderv1 "github.com/youruser/ap2-generated-contracts/proto/order/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"order-service/internal/cache"
+	"order-service/internal/middleware"
 	"order-service/internal/repository"
 	grpctransport "order-service/internal/transport/grpc"
 	"order-service/internal/transport/http"
 	"order-service/internal/usecase"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 func main() {
@@ -24,6 +32,8 @@ func main() {
 	httpAddr := mustEnv("ORDER_HTTP_ADDR")
 	grpcAddr := mustEnv("ORDER_GRPC_ADDR")
 	paymentTarget := mustEnv("PAYMENT_GRPC_TARGET")
+	redisAddr := mustEnv("REDIS_ADDR")
+	cacheTTL := mustDurationEnv("CACHE_TTL_SECONDS", 300)
 
 	db, err := sql.Open("postgres", dbConnStr)
 	if err != nil {
@@ -32,8 +42,12 @@ func main() {
 	if err := db.Ping(); err != nil {
 		log.Fatalf("failed to ping db: %v", err)
 	}
+	defer db.Close()
 
 	repo := repository.NewOrderRepository(db)
+	redisClient := redis.NewClient(&redis.Options{Addr: redisAddr})
+	defer redisClient.Close()
+	orderCache := cache.NewOrderCache(redisClient, cacheTTL)
 
 	paymentConn, err := grpc.Dial(
 		paymentTarget,
@@ -45,9 +59,10 @@ func main() {
 	defer paymentConn.Close()
 
 	paymentClient := grpctransport.NewPaymentClient(paymentConn)
-	uc := usecase.NewOrderUseCase(repo, paymentClient)
+	uc := usecase.NewOrderUseCase(repo, paymentClient, orderCache)
 
 	r := gin.Default()
+	r.Use(middleware.RateLimiter(redisClient, 10, time.Minute))
 	http.NewOrderHandler(r, uc)
 
 	httpServer := &nethttp.Server{
@@ -77,8 +92,22 @@ func main() {
 		errCh <- grpcServer.Serve(lis)
 	}()
 
-	if err := <-errCh; err != nil {
-		log.Fatalf("failed to run server: %v", err)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	select {
+	case <-ctx.Done():
+		log.Println("Shutting down Order Service gracefully...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("failed to shutdown HTTP server: %v", err)
+		}
+		grpcServer.GracefulStop()
+	case err := <-errCh:
+		if err != nil {
+			log.Fatalf("failed to run server: %v", err)
+		}
 	}
 }
 
@@ -88,4 +117,18 @@ func mustEnv(key string) string {
 		log.Fatalf("%s must be set", key)
 	}
 	return value
+}
+
+func mustDurationEnv(key string, defaultSeconds int) time.Duration {
+	value := os.Getenv(key)
+	if value == "" {
+		return time.Duration(defaultSeconds) * time.Second
+	}
+
+	seconds, err := strconv.Atoi(value)
+	if err != nil || seconds <= 0 {
+		log.Fatalf("%s must be a positive integer number of seconds", key)
+	}
+
+	return time.Duration(seconds) * time.Second
 }
